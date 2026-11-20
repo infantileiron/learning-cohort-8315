@@ -1,12 +1,12 @@
 # 常青 · 企业学习留存队列
 
-按首学周核对真实回访，在成熟观察周生成可追溯的干预名单。原生HTML/CSS/JS前端，Python真实计算，独立五服务Docker。
+按首学周核对真实回访，在成熟观察周生成可追溯的干预名单；流失风险方案以截至日前学习预测未来两周均无学习，评估通过后才可发布生效。原生HTML/CSS/JS前端，Python真实计算，独立五服务Docker。
 
 ## 真实业务与模块
 
 模拟客户常青企业大学，运营组服务200名学员。原工作流从学习平台导出 `常青_学习事件_20261115.xlsx`，用工作簿手工找首学日期、统计每周回访，再复制缺席名单到周会纪要。三个痛点：同周多事件重复计人数、截断历史把老学员误算新客、未观察完整的周被当成零留存。上游是学习事件；本项目替代队列计算、成熟判断与成员核对；下游由学习负责人签核辅导安排。
 
-四个业务模块：事件台账（录入/完整字段修订）、队列配置、留存矩阵（冻结版本/成熟遮罩/成员来源）、干预清单（站内草案/管理员签核/导出）。业务实体为Event、Cohort、Intervention，另有User和Audit。
+五个业务模块：事件台账（录入/完整字段修订）、队列配置、留存矩阵（冻结版本/成熟遮罩/成员来源）、流失风险（可换版方案/回测评估/阈值发布/评分失效）、干预清单（站内草案/管理员签核/导出）。业务实体为Event、Cohort、RiskScheme、RiskScore、Intervention，另有User、Meta和Audit。
 
 |角色|权限与典型动作|
 |---|---|
@@ -23,7 +23,7 @@ docker compose up -d --build
 docker compose exec -T backend python -m scripts.seed_demo
 ```
 
-前端 [localhost:18213](http://localhost:18213)，后端 [localhost:19213/docs](http://localhost:19213/docs)，MySQL宿主端口17713。演示邮箱 `admin@demo.local`、`analyst@demo.local`、`viewer@demo.local`，密码均 `Demo123!`。`SEED_DEMO=true`启动自动seed；自然键只插入缺失记录，不覆盖人工修订。种子包含200学员、2026-09-21起8个首学周、重复周内回访和截至日以后的未来事件。
+前端 [localhost:18213](http://localhost:18213)，后端 [localhost:19213/docs](http://localhost:19213/docs)，MySQL宿主端口17713。演示邮箱 `admin@demo.local`、`analyst@demo.local`、`viewer@demo.local`，密码均 `Demo123!`。`SEED_DEMO=true`启动自动seed；自然键只插入缺失记录，不覆盖人工修订。种子包含200学员、2026-09-21起8个首学周、重复周内回访、截至日以后的未来事件，以及三分之一渐冷学员（首学后1-3周沉默，供流失评估产生真实正负样本）。
 
 ## 一天的工作剧本
 
@@ -35,6 +35,9 @@ docker compose exec -T backend python -m scripts.seed_demo
 6. 09:40 worker计算，点击刷新；核对分母、W0到W5、未成熟遮罩。
 7. 10:00 点击成熟列“查看未回访”，写“核对排班后安排站内学习辅导”，保存冻结成员。
 8. 10:10 admin签核；10:20 viewer下载 `learning-cohort-<id>.json` 和 `learning-members-<id>.json`。
+9. 10:30 建“11月流失风险基线”：截至2026-11-14；worker回测评估后核对训练/验证样本与隔离说明。
+10. 10:40 在阈值表对比误报/漏报，选0.50并填“优先召回，误报成本仅为一次辅导”，发布为生效方案。
+11. 10:50 按当前高风险名单起草辅导，admin签核；11:00 修订一条事件后，受影响学员评分即时失效，重训发布后恢复。
 
 ## 计算口径与边界
 
@@ -46,6 +49,20 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 干预清单只能选已成功方案、成熟非W0列且有未回访成员的单元格。成员由服务端从冻结结果生成，忽略客户端自报名单；未成熟/空清单409。签核后说明和名单不可覆盖。仅站内保留行动记录，不向学员外发消息。
 
+## 流失风险方案
+
+单周缺席只能事后核对，无法提前识别持续失联。流失风险方案以**截至日以前的学习预测未来14天均无学习**（流失）。方案可换版，状态全程可查：queued（待评估）→running（评估中）→evaluated（已评估）→published（已生效）；发布新版后旧版置superseded（已换版），评估失败为failed，failed/evaluated可重新评估（重新快照当前事件）。
+
+**标签与验证口径**：标签仅取观察期完整的cutoff——验证cutoff=截至日-14天，训练cutoff再各前推14天，标签窗(cutoff,cutoff+14天]必然完整落在已收集数据内。按时间前推回测：训练cutoff早于验证cutoff；按学员哈希分组，同一学员只出现在训练或验证一侧，特征只用cutoff以前数据，杜绝未来信息泄漏。模型为标准化逻辑回归(L2)，特征含最近学习距今、近14/28天活跃、累计活跃、在册时长、最近间隔。
+
+**发布门槛**：评估报告给出0.05–0.95共19档阈值的误报（预测流失实际回访）与漏报（预测安全实际流失）、精确率、召回率。发布必须选择表内阈值并填写取舍说明；验证样本<30、真实流失<8或未流失<8视为证据不足，拒绝发布（409）。发布在事务内复核事件版本，源数据已变则评估过时、拒绝发布。
+
+**评分与失效**：发布时物化RiskScore，每条评分绑定训练范围（train_range）与事件版本（event_version）；等级=high（≥阈值）/medium（≥0.6阈值）/low。事件新增或修订使事件版本自增，受影响学员的valid评分即时置invalidated并记录原因；重训（新建或重新评估）发布后生成新有效评分，旧版评分随换版失效。发布、起草、签核均在事务内重查事件版本（MySQL行锁），并发交错时拒绝采用失效评分。
+
+**辅导起草**：仅已生效方案可起草，成员=当前valid高风险学员。未签核草案随当前高风险名单刷新；重复起草幂等返回同一草案（唯一约束source+scheme_id兜底），失败重试不重复生成。发布新版时清理旧版未签核草案，已签核清单永远保留。草案签核前若评分已失效或方案已换版，签核409，需重新起草。
+
+页面“流失风险”展示：方案状态、评估依据（训练/验证样本与学员数、隔离说明、训练范围、事件版本）、阈值取舍表、证据缺口、学员评分（概率/等级/有效状态/失效原因），覆盖时间交界、数据更正与发布交错的提示。
+
 ## 工程与本地开发
 
 |部分|实现|
@@ -55,9 +72,11 @@ docker compose exec -T backend python -m scripts.seed_demo
 |持久化|MySQL8、Redis7、命名产物卷|
 |worker|Redis任务队列、DB状态、心跳文件、启动恢复queued/running|
 
-目录：backend/src下routes/controllers/services/models/schemas/middlewares/config/utils/constants；frontend/src下api/stores/pages/components/common/hooks/utils/constants/types/router；backend/scripts/seed_demo.py；backend/migrations/001_initial.sql。所有计算/校验在Python，前端仅展示/交互。共有表格、表单字段、状态标签组件，form hook和HTML转义工具；请求ID与安全响应头两个中间件，写入业务审计和全局错误处理。
+目录：backend/src下routes/controllers/services/models/schemas/middlewares/config/utils/constants；frontend/src下api/stores/pages/components/common/hooks/utils/constants/types/router；backend/scripts/seed_demo.py；backend/migrations/001_initial.sql；backend/tests为pytest测试。所有计算/校验在Python，前端仅展示/交互。共有表格、表单字段、状态标签组件，form hook和HTML转义工具；请求ID与安全响应头两个中间件，写入业务审计和全局错误处理。
 
-共享枚举：ROLES、STATES、COURSES、STAGES在后端src/constants/enums.py与前端src/constants/enums.js；schema/business.py约束课程与配置，models/entities.py存储状态。实例数据与队列名隔离；backend/worker依赖db和Redis健康，worker还等backend，frontend等backend。数据库、Redis和/artifacts均命名卷；五服务各有healthcheck。worker每轮刷新/tmp/heartbeat，结果在共享/artifacts。Nginx `/api/`去前缀代理到后端根路由。
+共享枚举：ROLES、STATES、COURSES、STAGES、RISK_STATES、SCORE_STATES、RISK_LEVELS在后端src/constants/enums.py与前端src/constants/enums.js；schema/business.py约束课程与配置，models/entities.py存储状态。实例数据与队列名隔离；backend/worker依赖db和Redis健康，worker还等backend，frontend等backend。数据库、Redis和/artifacts均命名卷；五服务各有healthcheck。worker每轮刷新/tmp/heartbeat，结果在共享/artifacts（ARTIFACTS_DIR可覆盖）。Nginx `/api/`去前缀代理到后端根路由。
+
+测试：`cd backend && python -m pytest tests/`，SQLite内存库跑通完整API流程（同步执行任务代替Redis队列），覆盖标签时间交界、完整观察期、学员隔离、未来泄漏、阈值表、证据不足拒发、事件版本失效、发布/起草/签核交错、幂等起草、已签核保留与重训恢复。
 
 环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET。子网10.253.114.0/24规避本机默认地址池耗尽，移机可调整。部署时替换演示密码与JWT密钥。
 

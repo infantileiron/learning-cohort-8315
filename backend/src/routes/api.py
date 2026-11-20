@@ -1,14 +1,16 @@
-import os,json
+import json
 import redis
 from fastapi import APIRouter,Depends,HTTPException,Response
 from sqlalchemy.exc import IntegrityError
 from src.config.database import db
-from src.models.entities import User,Event,Cohort,Intervention,Audit
-from src.schemas.business import Login,EventInput,CohortInput,InterventionInput,NoteInput
+from src.models.entities import User,Event,Cohort,Intervention,Audit,RiskScheme,RiskScore
+from src.schemas.business import Login,EventInput,CohortInput,InterventionInput,NoteInput,RiskSchemeInput,PublishInput,RiskDraftInput
 from src.middlewares.auth import current,editor,admin
 from src.utils.security import verify,token
 from src.services.business import audit,dump
 from src.services.interventions import draft
+from src.services import queue,riskops
+from src.services.versions import event_version,bump_event_version,invalidate_scores
 from src.controllers.business import ensure_cohort,ensure_intervention
 router=APIRouter()
 @router.post('/auth/login')
@@ -27,26 +29,29 @@ def event(data:EventInput,u=Depends(editor),s=Depends(db)):
   if all(getattr(existing,k)==v for k,v in data.model_dump().items()):return dump(existing)
   raise HTTPException(409,'同事件编号的内容冲突，请修订原记录或使用新编号')
  r=Event(**data.model_dump());s.add(r)
- try:s.commit()
+ try:s.flush()
  except IntegrityError:
   s.rollback();other=s.query(Event).filter_by(code=data.code).first()
   if other and all(getattr(other,k)==v for k,v in data.model_dump().items()):return dump(other)
   raise HTTPException(409,'同事件编号的内容冲突')
+ v=bump_event_version(s);invalidate_scores(s,{r.learner},v);s.commit()
  audit(s,u,'录入学习事件 '+r.code);return dump(r)
 @router.put('/events/{i}')
 def edit_event(i:int,data:EventInput,u=Depends(editor),s=Depends(db)):
  r=s.get(Event,i)
  if not r:raise HTTPException(404,'事件不存在')
+ before=r.learner
  for k,v in data.model_dump().items():setattr(r,k,v)
- try:s.commit()
+ try:s.flush()
  except IntegrityError:s.rollback();raise HTTPException(409,'事件编号重复')
+ v=bump_event_version(s);invalidate_scores(s,{before,r.learner},v);s.commit()
  audit(s,u,'修订学习事件 '+str(i));return dump(r)
 @router.get('/cohorts')
 def cohorts(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(Cohort).order_by(Cohort.id.desc()).all()]
 @router.post('/cohorts')
 def cohort(data:CohortInput,u=Depends(editor),s=Depends(db)):
  cfg=data.model_dump(mode='json');snapshot={'config':cfg,'events':[dump(r) for r in s.query(Event).order_by(Event.id).all()]};r=Cohort(**cfg,result={'snapshot':snapshot});s.add(r);s.commit()
- try:redis.Redis.from_url(os.environ['REDIS_URL']).rpush('cohort:jobs',r.id)
+ try:queue.push('cohort:jobs',r.id)
  except redis.RedisError:r.state='failed';r.error='队列暂不可用，请稍后重试';s.commit();raise HTTPException(503,r.error)
  audit(s,u,'提交留存队列 '+str(r.id));return dump(r)
 @router.get('/cohorts/{i}')
@@ -68,11 +73,54 @@ def edit_intervention(i:int,data:NoteInput,u=Depends(editor),s=Depends(db)):
  r.note=data.note;s.commit();audit(s,u,'修订干预说明 '+str(i));return dump(r)
 @router.post('/interventions/{i}/approve')
 def approve(i:int,u=Depends(admin),s=Depends(db)):
- r=ensure_intervention(s,i)
+ r=s.query(Intervention).filter(Intervention.id==i).with_for_update().first()
+ if not r:raise HTTPException(404,'干预清单不存在')
  if r.status!='draft':raise HTTPException(409,'已签核，不可重复签核')
+ riskops.check_approval_fresh(s,r)
  r.status='approved';s.commit();audit(s,u,'签核干预清单 '+str(i));return dump(r)
 @router.get('/interventions/{i}/export')
 def action_export(i:int,u=Depends(current),s=Depends(db)):
  r=ensure_intervention(s,i);return dump(r)
+@router.get('/risk/schemes')
+def risk_schemes(u=Depends(current),s=Depends(db)):return [dump(r) for r in s.query(RiskScheme).order_by(RiskScheme.id.desc()).all()]
+@router.post('/risk/schemes')
+def risk_scheme(data:RiskSchemeInput,u=Depends(editor),s=Depends(db)):
+ cfg=data.model_dump(mode='json');snapshot={'config':cfg,'events':[dump(r) for r in s.query(Event).order_by(Event.id).all()]}
+ r=RiskScheme(**cfg,event_version=event_version(s),result={'snapshot':snapshot});s.add(r);s.commit()
+ try:queue.push('risk:jobs',r.id)
+ except redis.RedisError:r.state='failed';r.error='队列暂不可用，请稍后重试';s.commit();raise HTTPException(503,r.error)
+ audit(s,u,'提交流失风险评估 '+str(r.id));return dump(r)
+@router.get('/risk/schemes/{i}')
+def risk_detail(i:int,u=Depends(current),s=Depends(db)):return dump(riskops.ensure(s,i))
+@router.get('/risk/schemes/{i}/scores')
+def risk_scores(i:int,u=Depends(current),s=Depends(db)):
+ scheme=riskops.ensure(s,i)
+ rows=s.query(RiskScore).filter(RiskScore.scheme_id==i).order_by(RiskScore.score.desc(),RiskScore.learner).all()
+ if rows:return {'scheme_id':i,'materialized':True,'event_version':scheme.event_version,'scores':[dump(r) for r in rows]}
+ preview=(scheme.result or {}).get('scores',[])
+ return {'scheme_id':i,'materialized':False,'event_version':scheme.event_version,'scores':[{'learner':x['learner'],'score':x['score'],'level':'','status':'preview','reason':'待发布后生效'} for x in preview]}
+@router.post('/risk/schemes/{i}/retry')
+def risk_retry(i:int,u=Depends(editor),s=Depends(db)):
+ r=riskops.ensure(s,i)
+ if r.state not in('failed','evaluated'):raise HTTPException(409,'仅失败或已评估方案可重新评估')
+ cfg={'name':r.name,'as_of':r.as_of};snapshot={'config':cfg,'events':[dump(x) for x in s.query(Event).order_by(Event.id).all()]}
+ r.event_version=event_version(s);r.result={'snapshot':snapshot};r.state='queued';r.error='';s.commit()
+ try:queue.push('risk:jobs',r.id)
+ except redis.RedisError:r.state='failed';r.error='队列暂不可用，请稍后重试';s.commit();raise HTTPException(503,r.error)
+ audit(s,u,'重新评估流失风险方案 '+str(i));return dump(r)
+@router.post('/risk/schemes/{i}/publish')
+def risk_publish(i:int,data:PublishInput,u=Depends(editor),s=Depends(db)):
+ r=riskops.lock(s,i)
+ riskops.publish(s,r,data.threshold,data.rationale)
+ s.commit();audit(s,u,f'发布流失风险方案 {i} 阈值 {data.threshold}');return dump(r)
+@router.post('/risk/schemes/{i}/draft')
+def risk_draft(i:int,data:RiskDraftInput,u=Depends(editor),s=Depends(db)):
+ r=riskops.lock(s,i)
+ iv=riskops.draft(s,r,data.note)
+ try:s.commit()
+ except IntegrityError:
+  s.rollback();iv=s.query(Intervention).filter(Intervention.source=='risk',Intervention.scheme_id==i).first()
+  if not iv:raise HTTPException(409,'起草冲突，请重试')
+ audit(s,u,'起草风险辅导 '+str(iv.id));return dump(iv)
 @router.get('/audits')
 def audits(u=Depends(admin),s=Depends(db)):return [dump(r) for r in s.query(Audit).order_by(Audit.id.desc()).limit(100)]

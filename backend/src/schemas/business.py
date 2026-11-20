@@ -30,3 +30,11 @@ class InterventionInput(BaseModel):
  week_index:int=Field(ge=1,le=8)
  note:str=Field(min_length=8,max_length=2000)
 class NoteInput(BaseModel):note:str=Field(min_length=8,max_length=2000)
+class RiskSchemeInput(BaseModel):
+ name:str=Field(min_length=2,max_length=100)
+ as_of:date
+class PublishInput(BaseModel):
+ threshold:float=Field(gt=0,lt=1)
+ rationale:str=Field(min_length=8,max_length=2000)
+class RiskDraftInput(BaseModel):
+ note:str=Field(min_length=8,max_length=2000)

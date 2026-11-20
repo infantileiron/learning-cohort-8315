@@ -11,8 +11,10 @@ def seed():
    if not s.query(User).filter_by(email=email).first():s.add(User(email=email,role=role,password=hash_password('Demo123!')))
   for i in range(200):
    first=i//25;learner=f'CQ-{i+1:03}'
+   fade=min(first+1+(i//3)%3,5) if i%3==0 and first<=5 else None
    for w in range(first,9):
-    if w!=first and rng.random()>.82-.07*(w-first):continue
+    if fade is not None and w>fade:continue
+    if w!=first and fade is None and rng.random()>.82-.07*(w-first):continue
     day=start+timedelta(weeks=w,days=1+i%3);stamp=day.isoformat()+'T02:00:00+00:00'
     code=f'{learner}-W{w}'
     if not s.query(Event).filter_by(code=code).first():s.add(Event(code=code,learner=learner,occurred_at=stamp,course=('数据素养','服务沟通','安全规范')[i%3],note='学习平台正常上报'))
